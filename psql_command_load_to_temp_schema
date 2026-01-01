@@ -1,0 +1,2 @@
+sed 's/COPY public\./COPY staging\./g' dump2_data_only.sql \
+| psql -U mr_data mrs_db -v ON_ERROR_STOP=on

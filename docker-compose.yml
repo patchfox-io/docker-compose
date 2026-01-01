@@ -1,0 +1,324 @@
+version: '3'
+services:
+
+  # zookeeper:
+  #   image: confluentinc/cp-zookeeper:latest
+  #   environment:
+  #     ZOOKEEPER_CLIENT_PORT: 2181
+  #     ZOOKEEPER_TICK_TIME: 2000
+  
+  # kafka:
+  #   image: confluentinc/cp-kafka:latest
+  #   depends_on:
+  #     - zookeeper
+  #   environment:
+  #     KAFKA_BROKER_ID: 1
+  #     KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  #     KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+  #     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+  #     KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  #     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+ 
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: mr_data
+      POSTGRES_PASSWORD: omnomdata
+      POSTGRES_DB: mrs_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mr_data -d mrs_db"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+    ports:
+      - 54321:5432  
+
+  analyze-service:
+    image: analyze-service:latest
+    ports:
+      - 1701:8080
+    environment:                                                                
+      POSTGRES_USER: mr_data                                                    
+      POSTGRES_PASSWORD: omnomdata                                              
+      POSTGRES_DB: mrs_db  
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+
+
+  # analyze-service:
+  #   image: analyze-service:latest
+  #   ports:
+  #     - 1701:8080
+  #   environment:                                                                
+  #     POSTGRES_USER: mr_data                                                    
+  #     POSTGRES_PASSWORD: omnomdata                                              
+  #     POSTGRES_DB: mrs_db  
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+  #     JAVA_OPTS: "-XX:+FlightRecorder -XX:StartFlightRecording=duration=300s,filename=/tmp/profile.jfr -XX:FlightRecorderOptions=dumponexitpath=/tmp/profile.jfr"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+
+
+
+
+
+  data-service:
+    image: data-service:latest
+    ports:
+      - 1702:8080
+    environment:                                                                
+      POSTGRES_USER: mr_data                                                    
+      POSTGRES_PASSWORD: omnomdata                                              
+      POSTGRES_DB: mrs_db  
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # forecast-service:
+  #   image: forecast-service:latest
+  #   ports:
+  #     - 1703:8080
+  #   environment:                                                                
+  #     POSTGRES_USER: mr_data                                                    
+  #     POSTGRES_PASSWORD: omnomdata                                              
+  #     POSTGRES_DB: mrs_db  
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db        
+  #     DATABRICKS_TOKEN: databricks_token 
+  #     DATABRICKS_URL: http://databricks-dummy-service:8080/api/v1/databricks
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  grype-service:
+    image: grype-service:latest
+    ports:
+      - 1704:8080
+    environment:
+      POSTGRES_USER: mr_data
+      POSTGRES_PASSWORD: omnomdata
+      POSTGRES_DB: mrs_db
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+      SPRING_KAFKA_GROUP_NAME: grype-service_GROUP  # Add this line
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # grype-service-1:
+  #   image: grype-service:latest
+  #   ports:
+  #     - 1704:8080
+  #   environment:
+  #     POSTGRES_USER: mr_data
+  #     POSTGRES_PASSWORD: omnomdata
+  #     POSTGRES_DB: mrs_db
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+  #     SPRING_KAFKA_GROUP_NAME: grype-service_GROUP  # Add this line
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  # grype-service-2:
+  #   image: grype-service:latest
+  #   ports:
+  #     - 1705:8080
+  #   environment:
+  #     POSTGRES_USER: mr_data
+  #     POSTGRES_PASSWORD: omnomdata
+  #     POSTGRES_DB: mrs_db
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+  #     SPRING_KAFKA_GROUP_NAME: grype-service_GROUP  # Add this line
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  # grype-service-3:
+  #   image: grype-service:latest
+  #   ports:
+  #     - 1706:8080
+  #   environment:
+  #     POSTGRES_USER: mr_data
+  #     POSTGRES_PASSWORD: omnomdata
+  #     POSTGRES_DB: mrs_db
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+  #     SPRING_KAFKA_GROUP_NAME: grype-service_GROUP  # Add this line
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  input-service:
+    image: input-service:latest
+    ports:
+      - 1711:8080
+    environment:                                                                
+      POSTGRES_USER: mr_data                                                    
+      POSTGRES_PASSWORD: omnomdata                                              
+      POSTGRES_DB: mrs_db  
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # nvd-service:
+  #   image: nvd-service:latest
+  #   ports:
+  #     - 1706:8080
+  #   environment:                                                                
+  #     POSTGRES_USER: mr_data                                                    
+  #     POSTGRES_PASSWORD: omnomdata                                              
+  #     POSTGRES_DB: mrs_db  
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  orchestrate-service:
+    image: orchestrate-service:latest
+    ports:
+      - 1707:8080
+    environment:                                                                
+      POSTGRES_USER: mr_data                                                    
+      POSTGRES_PASSWORD: omnomdata                                              
+      POSTGRES_DB: mrs_db  
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  package-index-service:
+    image: package-index-service:latest
+    ports:
+      - 1708:8080
+    environment:                                                                
+      POSTGRES_USER: mr_data                                                    
+      POSTGRES_PASSWORD: omnomdata                                              
+      POSTGRES_DB: mrs_db  
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  recommend-service:
+    image: recommend-service:latest
+    ports:
+      - 1709:8080
+    environment:                                                                
+      POSTGRES_USER: mr_data                                                    
+      POSTGRES_PASSWORD: omnomdata                                              
+      POSTGRES_DB: mrs_db  
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db      
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s   
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # databricks-dummy-service:
+  #   image: databricks-dummy-service:latest
+  #   ports:
+  #     - 1710:8080
+  #   environment:                                                                
+  #     POSTGRES_USER: mr_data                                                    
+  #     POSTGRES_PASSWORD: omnomdata                                              
+  #     POSTGRES_DB: mrs_db  
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  databricks-service:
+    image: leah
+    environment:
+      POSTGRES_USER: mr_data
+      POSTGRES_PASSWORD: omnomdata
+      POSTGRES_DB: mrs_db
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      recommend-service:
+        condition: service_healthy
+
+  # patch-ui:
+  #   image: registry.gitlab.com/patchfox2/patch-ui:develop
+  #   restart: unless-stopped
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+
+  #
+  # not complete working solution for this -- TODO update with valid config 
+  #
+  #
+  #
