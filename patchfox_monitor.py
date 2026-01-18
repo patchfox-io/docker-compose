@@ -9,6 +9,7 @@ import psycopg2
 import docker
 import requests
 from datetime import datetime, timedelta
+from dateutil import parser
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
@@ -24,13 +25,13 @@ import psutil
 console = Console()
 
 # Configuration
+DATA_SERVICE_URL = "http://localhost:1702"
+ORCHESTRATE_URL = "http://localhost:1707"
 POSTGRES_HOST = "localhost"
 POSTGRES_PORT = 54321
 POSTGRES_DB = "mrs_db"
 POSTGRES_USER = "mr_data"
 POSTGRES_PASSWORD = "omnomdata"
-
-ORCHESTRATE_URL = "http://localhost:1707"
 
 # History tracking for sparklines
 cpu_history = []
@@ -47,6 +48,22 @@ def get_db_connection():
         user=POSTGRES_USER,
         password=POSTGRES_PASSWORD
     )
+
+
+def dq_query(table_name, params=None):
+    """Query data-service DQ API - returns (content, total_elements)"""
+    try:
+        url = f"{DATA_SERVICE_URL}/api/v1/db/{table_name}/query"
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        title_page = data.get('data', {}).get('titlePage', {})
+        content = title_page.get('content', [])
+        total_elements = title_page.get('totalElements', len(content))
+        return content, total_elements
+    except Exception as e:
+        console.print(f"[red]DQ API Error ({table_name}): {e}[/red]")
+        return [], 0
 
 
 def create_sparkline(data, width=20, height=5):
@@ -72,125 +89,129 @@ def create_sparkline(data, width=20, height=5):
 
 
 def get_dataset_info():
-    """Get comprehensive dataset processing status"""
+    """Get comprehensive dataset processing status using DQ API"""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
         # Get dataset info
-        cur.execute("SELECT id, name, status FROM dataset LIMIT 1;")
-        dataset = cur.fetchone()
-
-        if not dataset:
+        datasets, _ = dq_query('dataset')
+        if not datasets:
             return None
 
-        dataset_id, dataset_name, dataset_status = dataset
+        dataset = datasets[0]
+        dataset_id = dataset['id']
+        dataset_name = dataset['name']
+        dataset_status = dataset['status']
+        dataset_updated_at = dataset.get('updatedAt')
 
-        # Get active job_id (most common job_id among currently processing events)
-        cur.execute("""
-            SELECT job_id, COUNT(*) as cnt
-            FROM datasource_event
-            WHERE status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING')
-              AND job_id IS NOT NULL
-            GROUP BY job_id
-            ORDER BY cnt DESC
-            LIMIT 1;
-        """)
-        job_result = cur.fetchone()
-        active_job_id = job_result[0] if job_result else None
+        # Get all events that are actively processing to find the most common job_id
+        # DQ API doesn't support GROUP BY, so we need to fetch and process client-side
+        active_events, _ = dq_query('datasourceEvent', {
+            'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING'
+        })
 
-        # Get event counts by status (only for current job_id)
+        # Count job_ids to find the most active one
+        job_id_counts = {}
+        for event in active_events:
+            job_id = event.get('jobId')
+            if job_id:
+                job_id_counts[job_id] = job_id_counts.get(job_id, 0) + 1
+
+        active_job_id = max(job_id_counts.keys(), key=lambda k: job_id_counts[k]) if job_id_counts else None
+
         if active_job_id:
-            cur.execute("""
-                SELECT status, COUNT(*)
-                FROM datasource_event
-                WHERE job_id = %s
-                  AND status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING_ERROR')
-                GROUP BY status;
-            """, (active_job_id,))
-            active_event_counts = dict(cur.fetchall())
+            # Get total count of all events for this job
+            _, total_job_events = dq_query('datasourceEvent', {'jobId': active_job_id})
 
-            # Get total event counts for current job
-            cur.execute("""
-                SELECT status, COUNT(*)
-                FROM datasource_event
-                WHERE job_id = %s
-                GROUP BY status;
-            """, (active_job_id,))
-            all_event_counts = dict(cur.fetchall())
+            # Get counts for each status separately using totalElements
+            _, processing_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'PROCESSING'})
+            _, ready_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'READY_FOR_PROCESSING'})
+            _, ready_next_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'READY_FOR_NEXT_PROCESSING'})
+            _, processed_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'PROCESSED'})
+            _, error_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'PROCESSING_ERROR'})
 
-            # Get enrichment progress (only for current job)
-            cur.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN oss_enriched = true THEN 1 ELSE 0 END) as oss_done,
-                    SUM(CASE WHEN package_index_enriched = true THEN 1 ELSE 0 END) as pkg_done,
-                    SUM(CASE WHEN analyzed = true THEN 1 ELSE 0 END) as analyzed_done,
-                    SUM(CASE WHEN forecasted = true THEN 1 ELSE 0 END) as forecasted_done,
-                    SUM(CASE WHEN recommended = true THEN 1 ELSE 0 END) as recommended_done
-                FROM datasource_event
-                WHERE job_id = %s
-                  AND status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING');
-            """, (active_job_id,))
-            progress = cur.fetchone()
+            # Get enrichment progress counts using boolean field filters
+            _, oss_done = dq_query('datasourceEvent', {
+                'jobId': active_job_id,
+                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
+                'ossEnriched': 'true'
+            })
+            _, pkg_done = dq_query('datasourceEvent', {
+                'jobId': active_job_id,
+                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
+                'packageIndexEnriched': 'true'
+            })
+            _, analyzed_done = dq_query('datasourceEvent', {
+                'jobId': active_job_id,
+                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
+                'analyzed': 'true'
+            })
+            _, forecasted_done = dq_query('datasourceEvent', {
+                'jobId': active_job_id,
+                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
+                'forecasted': 'true'
+            })
+            _, recommended_done = dq_query('datasourceEvent', {
+                'jobId': active_job_id,
+                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
+                'recommended': 'true'
+            })
 
-            # Get error count for current job
-            cur.execute("""
-                SELECT COUNT(*)
-                FROM datasource_event
-                WHERE job_id = %s
-                  AND (status = 'PROCESSING_ERROR' OR processing_error IS NOT NULL);
-            """, (active_job_id,))
-            error_count = cur.fetchone()[0]
+            # Build status counts
+            active_event_counts = {
+                'PROCESSING': processing_count,
+                'READY_FOR_PROCESSING': ready_count,
+                'READY_FOR_NEXT_PROCESSING': ready_next_count,
+                'PROCESSING_ERROR': error_count
+            }
+            all_event_counts = {
+                'PROCESSING': processing_count,
+                'READY_FOR_PROCESSING': ready_count,
+                'READY_FOR_NEXT_PROCESSING': ready_next_count,
+                'PROCESSED': processed_count,
+                'PROCESSING_ERROR': error_count
+            }
+
+            total_active = processing_count + ready_count + ready_next_count
+            progress = (total_active, oss_done, pkg_done, analyzed_done, forecasted_done, recommended_done)
         else:
             active_event_counts = {}
             all_event_counts = {}
+            total_job_events = 0
             progress = (0, 0, 0, 0, 0, 0)
             error_count = 0
 
         # Get datasource count
-        cur.execute("SELECT COUNT(*) FROM datasource;")
-        datasource_count = cur.fetchone()[0]
+        datasources, total_datasources = dq_query('datasource')
+        datasource_count = total_datasources
 
         # Get findings and package metrics from latest dataset_metrics snapshot for current job
-        # Order by commit_date_time DESC to get the most recent commit's metrics
         if active_job_id:
-            cur.execute("""
-                SELECT
-                    critical_findings,
-                    high_findings,
-                    medium_findings,
-                    low_findings,
-                    total_findings,
-                    packages,
-                    packages_with_findings,
-                    downlevel_packages_major,
-                    downlevel_packages_minor,
-                    downlevel_packages_patch,
-                    stale_packages_two_years,
-                    packages - downlevel_packages_major - downlevel_packages_minor - downlevel_packages_patch as packages_with_updates
-                FROM dataset_metrics
-                WHERE job_id = %s AND is_current = true
-                ORDER BY commit_date_time DESC
-                LIMIT 1;
-            """, (active_job_id,))
-            metrics_row = cur.fetchone()
+            metrics, _ = dq_query('datasetMetrics', {
+                'jobId': active_job_id,
+                'isCurrent': 'true'
+            })
+
+            # Sort by commitDateTime DESC to get most recent commit's metrics
+            if metrics:
+                metrics.sort(key=lambda x: x.get('commitDateTime', ''), reverse=True)
+                metrics_row = metrics[0]
+            else:
+                metrics_row = None
         else:
             metrics_row = None
 
         if metrics_row:
-            critical_finding_count = metrics_row[0] or 0
-            high_finding_count = metrics_row[1] or 0
-            medium_finding_count = metrics_row[2] or 0
-            low_finding_count = metrics_row[3] or 0
-            total_findings = metrics_row[4] or 0
-            package_count = metrics_row[5] or 0
-            packages_with_findings = metrics_row[6] or 0
-            major_behind = metrics_row[7] or 0
-            minor_behind = metrics_row[8] or 0
-            patch_behind = metrics_row[9] or 0
-            stale_packages = metrics_row[10] or 0
-            packages_with_updates = metrics_row[11] or 0
+            critical_finding_count = metrics_row.get('criticalFindings') or 0
+            high_finding_count = metrics_row.get('highFindings') or 0
+            medium_finding_count = metrics_row.get('mediumFindings') or 0
+            low_finding_count = metrics_row.get('lowFindings') or 0
+            total_findings = metrics_row.get('totalFindings') or 0
+            package_count = metrics_row.get('packages') or 0
+            packages_with_findings = metrics_row.get('packagesWithFindings') or 0
+            major_behind = metrics_row.get('downlevelPackagesMajor') or 0
+            minor_behind = metrics_row.get('downlevelPackagesMinor') or 0
+            patch_behind = metrics_row.get('downlevelPackagesPatch') or 0
+            stale_packages = metrics_row.get('stalePackagesTwoYears') or 0
+            packages_with_updates = package_count - major_behind - minor_behind - patch_behind
             package_metrics = (package_count, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates)
         else:
             # Fallback if no dataset_metrics exist
@@ -203,16 +224,15 @@ def get_dataset_info():
             packages_with_findings = 0
             package_metrics = (0, 0, 0, 0, 0, 0)
 
-        cur.close()
-        conn.close()
-
         return {
             'id': dataset_id,
             'name': dataset_name,
             'status': dataset_status,
+            'updated_at': dataset_updated_at,
             'active_job_id': active_job_id,
             'active_event_counts': active_event_counts,
             'all_event_counts': all_event_counts,
+            'total_events': total_job_events if active_job_id else 0,
             'progress': progress,
             'error_count': error_count,
             'datasource_count': datasource_count,
@@ -228,6 +248,19 @@ def get_dataset_info():
         }
     except Exception as e:
         return {'error': str(e)}
+
+
+def get_peristalsis_state():
+    """Get peristalsis (orchestrate) activation state"""
+    try:
+        url = f"{ORCHESTRATE_URL}/api/v1/peristalsis"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        return data.get('data', {}).get('activated', False)
+    except Exception as e:
+        console.print(f"[red]Peristalsis API Error: {e}[/red]")
+        return None
 
 
 def get_postgres_stats():
@@ -335,7 +368,7 @@ def get_host_stats():
         return {'error': str(e)}
 
 
-def create_pipeline_status_panel(dataset_info):
+def create_pipeline_status_panel(dataset_info, peristalsis_state=None):
     """Create comprehensive pipeline status panel"""
     if not dataset_info or 'error' in dataset_info:
         return Panel(f"⚠️  Unable to fetch dataset info: {dataset_info.get('error', 'Unknown error')}",
@@ -369,6 +402,39 @@ def create_pipeline_status_panel(dataset_info):
         job_id_str = str(dataset_info['active_job_id'])[:8]  # Show first 8 chars of UUID
         table.add_row("Job ID:", f"[cyan]{job_id_str}...[/]")
 
+    # Show peristalsis state
+    if peristalsis_state is not None:
+        peristalsis_color = "green" if peristalsis_state else "red"
+        peristalsis_text = "ON" if peristalsis_state else "OFF"
+        table.add_row("~ Peristalsis:", f"[{peristalsis_color}]{peristalsis_text}[/]")
+    else:
+        table.add_row("~ Peristalsis:", "[dim]Unknown[/]")
+
+    # Show job duration only when actively processing
+    if dataset_info['status'] == 'PROCESSING' and dataset_info.get('updated_at'):
+        try:
+            updated_at = parser.isoparse(dataset_info['updated_at'])
+            now = datetime.now(updated_at.tzinfo)
+            duration = now - updated_at
+
+            # Format duration
+            total_seconds = int(duration.total_seconds())
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+
+            if hours > 0:
+                duration_str = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                duration_str = f"{minutes}m {seconds}s"
+            else:
+                duration_str = f"{seconds}s"
+
+            table.add_row("T Job Duration:", f"[yellow]{duration_str}[/]")
+        except Exception as e:
+            # If parsing fails, silently skip duration display
+            pass
+
     table.add_row("", "")
 
     # Event status breakdown
@@ -387,7 +453,7 @@ def create_pipeline_status_panel(dataset_info):
     # Total events by status
     all_counts = dataset_info['all_event_counts']
     processed = all_counts.get('PROCESSED', 0)
-    total_events = sum(all_counts.values())
+    total_events = dataset_info.get('total_events', 0)
 
     table.add_row("✅ Processed:", f"[green]{processed:,}[/]")
     table.add_row("📈 Total Events:", f"[bold cyan]{total_events:,}[/]")
@@ -504,7 +570,7 @@ def create_containers_panel(container_stats):
 def create_postgres_panel(pg_stats):
     """Create postgres stats panel"""
     if 'error' in pg_stats:
-        return Panel(f"⚠️  {pg_stats['error']}", title="Postgres", border_style="red")
+        return Panel(f"[red]Error: {pg_stats['error']}[/]", title="P PostgreSQL", border_style="red")
 
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan", width=25)
@@ -512,10 +578,10 @@ def create_postgres_panel(pg_stats):
 
     conn_stats = pg_stats.get('conn_stats', {})
 
-    table.add_row("🔌 Active:", f"[yellow]{conn_stats.get('active', 0)}[/]")
-    table.add_row("💤 Idle:", f"[green]{conn_stats.get('idle', 0)}[/]")
-    table.add_row("⏳ Idle in TX:", f"[red]{conn_stats.get('idle in transaction', 0)}[/]")
-    table.add_row("🔍 Active Queries:", f"[cyan]{pg_stats['active_queries']}[/]")
+    table.add_row("Active:", f"[yellow]{conn_stats.get('active', 0)}[/]")
+    table.add_row("Idle:", f"[green]{conn_stats.get('idle', 0)}[/]")
+    table.add_row("Idle in TX:", f"[red]{conn_stats.get('idle in transaction', 0)}[/]")
+    table.add_row("Active Queries:", f"[cyan]{pg_stats.get('active_queries', 0)}[/]")
 
     return Panel(table, title="P PostgreSQL", border_style="magenta", box=box.ROUNDED)
 
@@ -553,7 +619,7 @@ def create_host_panel(host_stats):
     return Panel(table, title="H  Host System", border_style="cyan", box=box.ROUNDED)
 
 
-def create_dashboard(next_refresh_in, dataset_info=None, container_stats=None, pg_stats=None, host_stats=None, updating=False):
+def create_dashboard(next_refresh_in, dataset_info=None, container_stats=None, pg_stats=None, host_stats=None, peristalsis_state=None, updating=False):
     """Create the main dashboard layout"""
     # Only fetch data if not provided (i.e., on actual refresh)
     if dataset_info is None:
@@ -564,6 +630,8 @@ def create_dashboard(next_refresh_in, dataset_info=None, container_stats=None, p
         pg_stats = get_postgres_stats()
     if host_stats is None:
         host_stats = get_host_stats()
+    if peristalsis_state is None:
+        peristalsis_state = get_peristalsis_state()
 
     layout = Layout()
 
@@ -602,7 +670,7 @@ def create_dashboard(next_refresh_in, dataset_info=None, container_stats=None, p
     )
 
     # Left column
-    layout["left"].update(create_pipeline_status_panel(dataset_info))
+    layout["left"].update(create_pipeline_status_panel(dataset_info, peristalsis_state))
 
     # Middle column
     layout["middle"].update(create_package_health_panel(dataset_info))
@@ -642,8 +710,9 @@ def main():
         container_stats = get_container_stats()
         pg_stats = get_postgres_stats()
         host_stats = get_host_stats()
+        peristalsis_state = get_peristalsis_state()
 
-        with Live(create_dashboard(refresh_interval, dataset_info, container_stats, pg_stats, host_stats, updating=False),
+        with Live(create_dashboard(refresh_interval, dataset_info, container_stats, pg_stats, host_stats, peristalsis_state, updating=False),
                   refresh_per_second=update_rate, console=console, screen=True) as live:
             while True:
                 start_time = time.time()
@@ -652,20 +721,21 @@ def main():
                 while time.time() - start_time < refresh_interval:
                     elapsed = time.time() - start_time
                     remaining = refresh_interval - elapsed
-                    live.update(create_dashboard(remaining, dataset_info, container_stats, pg_stats, host_stats, updating=False))
+                    live.update(create_dashboard(remaining, dataset_info, container_stats, pg_stats, host_stats, peristalsis_state, updating=False))
                     time.sleep(0.1)
 
                 # Show UPDATING message
-                live.update(create_dashboard(0, dataset_info, container_stats, pg_stats, host_stats, updating=True))
+                live.update(create_dashboard(0, dataset_info, container_stats, pg_stats, host_stats, peristalsis_state, updating=True))
 
                 # Fetch fresh data after countdown completes
                 dataset_info = get_dataset_info()
                 container_stats = get_container_stats()
                 pg_stats = get_postgres_stats()
                 host_stats = get_host_stats()
+                peristalsis_state = get_peristalsis_state()
 
                 # Display with refreshed data and reset timer to full interval
-                live.update(create_dashboard(refresh_interval, dataset_info, container_stats, pg_stats, host_stats, updating=False))
+                live.update(create_dashboard(refresh_interval, dataset_info, container_stats, pg_stats, host_stats, peristalsis_state, updating=False))
 
     except KeyboardInterrupt:
         console.print("\n\n[bold yellow]👋 Shutting down monitor...[/bold yellow]\n")
