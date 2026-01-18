@@ -34,31 +34,93 @@ services:
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
 
+  # postgres:
+  #   image: postgres:latest
+  #   environment:
+  #     POSTGRES_USER: mr_data
+  #     POSTGRES_PASSWORD: omnomdata
+  #     POSTGRES_DB: mrs_db
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U mr_data -d mrs_db"]
+  #     interval: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #     timeout: 10s
+  #   ports:
+  #     - 54321:5432  
+
   postgres:
     image: postgres:latest
     environment:
       POSTGRES_USER: mr_data
       POSTGRES_PASSWORD: omnomdata
       POSTGRES_DB: mrs_db
+    ports:
+      - "54321:5432"
+
+    # Persist PGDATA off the container's overlay filesystem (critical)
+    # Option A (recommended): bind mount to a real disk path on the host
+    # volumes:
+    #   - /var/lib/postgres/mrs_db:/var/lib/postgresql/data
+
+    # If you can't/don't want a bind mount, use a named volume instead:
+    volumes:
+      - pgdata:/var/lib/postgresql
+      # should it be this?? pgdata:/var/lib/postgresql/data
+
+
+    # THIS PREVENTS POSTGRES CHECKPOINTING FROM CAUSING DOOM FOR pf JOBS 
+    command:
+      - postgres
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - log_checkpoints=on
+      - -c
+      - max_wal_size=16GB
+      - -c
+      - min_wal_size=4GB
+      - -c
+      - idle_in_transaction_session_timeout=67min
+
+      # Strongly recommended baseline memory (adjust to your container limit)
+      # If Postgres container has ~8GB RAM, these are sane:
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - maintenance_work_mem=1GB
+
+      # Optional: if you have many connections, cap it and size work_mem accordingly
+      # - -c
+      # - max_connections=200
+
+      # Optional: helps parallel query/maintenance on capable hosts
+      # - -c
+      # - max_parallel_workers=8
+      # - -c
+      # - max_parallel_workers_per_gather=4
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mr_data -d mrs_db"]
       interval: 10s
       retries: 5
       start_period: 30s
       timeout: 10s
-    ports:
-      - 54321:5432  
 
   analyze-service:
     image: analyze-service:latest
     ports:
       - 1701:8080
-    environment:                                                                
-      POSTGRES_USER: mr_data                                                    
-      POSTGRES_PASSWORD: omnomdata                                              
-      POSTGRES_DB: mrs_db  
+    environment:
+      POSTGRES_USER: mr_data
+      POSTGRES_PASSWORD: omnomdata
+      POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,12 +155,12 @@ services:
     image: data-service:latest
     ports:
       - 1702:8080
-    environment:                                                                
-      POSTGRES_USER: mr_data                                                    
-      POSTGRES_PASSWORD: omnomdata                                              
-      POSTGRES_DB: mrs_db  
+    environment:
+      POSTGRES_USER: mr_data
+      POSTGRES_PASSWORD: omnomdata
+      POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
     depends_on:
       postgres:
         condition: service_healthy
@@ -227,12 +289,12 @@ services:
     image: orchestrate-service:latest
     ports:
       - 1707:8080
-    environment:                                                                
-      POSTGRES_USER: mr_data                                                    
-      POSTGRES_PASSWORD: omnomdata                                              
-      POSTGRES_DB: mrs_db  
+    environment:
+      POSTGRES_USER: mr_data
+      POSTGRES_PASSWORD: omnomdata
+      POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db         
+      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
     depends_on:
       postgres:
         condition: service_healthy
@@ -322,3 +384,6 @@ services:
   #
   #
   #
+
+volumes:
+  pgdata:
