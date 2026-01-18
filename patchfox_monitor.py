@@ -99,76 +99,109 @@ def get_dataset_info():
         job_result = cur.fetchone()
         active_job_id = job_result[0] if job_result else None
 
-        # Get event counts by status (only active processing states)
-        cur.execute("""
-            SELECT status, COUNT(*)
-            FROM datasource_event
-            WHERE status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING_ERROR')
-            GROUP BY status;
-        """)
-        active_event_counts = dict(cur.fetchall())
+        # Get event counts by status (only for current job_id)
+        if active_job_id:
+            cur.execute("""
+                SELECT status, COUNT(*)
+                FROM datasource_event
+                WHERE job_id = %s
+                  AND status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING_ERROR')
+                GROUP BY status;
+            """, (active_job_id,))
+            active_event_counts = dict(cur.fetchall())
 
-        # Get total event counts
-        cur.execute("""
-            SELECT status, COUNT(*)
-            FROM datasource_event
-            GROUP BY status;
-        """)
-        all_event_counts = dict(cur.fetchall())
+            # Get total event counts for current job
+            cur.execute("""
+                SELECT status, COUNT(*)
+                FROM datasource_event
+                WHERE job_id = %s
+                GROUP BY status;
+            """, (active_job_id,))
+            all_event_counts = dict(cur.fetchall())
 
-        # Get enrichment progress (only for active events)
-        cur.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN oss_enriched = true THEN 1 ELSE 0 END) as oss_done,
-                SUM(CASE WHEN package_index_enriched = true THEN 1 ELSE 0 END) as pkg_done,
-                SUM(CASE WHEN analyzed = true THEN 1 ELSE 0 END) as analyzed_done,
-                SUM(CASE WHEN forecasted = true THEN 1 ELSE 0 END) as forecasted_done,
-                SUM(CASE WHEN recommended = true THEN 1 ELSE 0 END) as recommended_done
-            FROM datasource_event
-            WHERE status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING');
-        """)
-        progress = cur.fetchone()
+            # Get enrichment progress (only for current job)
+            cur.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN oss_enriched = true THEN 1 ELSE 0 END) as oss_done,
+                    SUM(CASE WHEN package_index_enriched = true THEN 1 ELSE 0 END) as pkg_done,
+                    SUM(CASE WHEN analyzed = true THEN 1 ELSE 0 END) as analyzed_done,
+                    SUM(CASE WHEN forecasted = true THEN 1 ELSE 0 END) as forecasted_done,
+                    SUM(CASE WHEN recommended = true THEN 1 ELSE 0 END) as recommended_done
+                FROM datasource_event
+                WHERE job_id = %s
+                  AND status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING');
+            """, (active_job_id,))
+            progress = cur.fetchone()
 
-        # Get error count
-        cur.execute("SELECT COUNT(*) FROM datasource_event WHERE status = 'PROCESSING_ERROR' OR processing_error IS NOT NULL;")
-        error_count = cur.fetchone()[0]
+            # Get error count for current job
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM datasource_event
+                WHERE job_id = %s
+                  AND (status = 'PROCESSING_ERROR' OR processing_error IS NOT NULL);
+            """, (active_job_id,))
+            error_count = cur.fetchone()[0]
+        else:
+            active_event_counts = {}
+            all_event_counts = {}
+            progress = (0, 0, 0, 0, 0, 0)
+            error_count = 0
 
-        # Get record counts
+        # Get datasource count
         cur.execute("SELECT COUNT(*) FROM datasource;")
         datasource_count = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM package;")
-        package_count = cur.fetchone()[0]
+        # Get findings and package metrics from latest dataset_metrics snapshot for current job
+        # Order by commit_date_time DESC to get the most recent commit's metrics
+        if active_job_id:
+            cur.execute("""
+                SELECT
+                    critical_findings,
+                    high_findings,
+                    medium_findings,
+                    low_findings,
+                    total_findings,
+                    packages,
+                    packages_with_findings,
+                    downlevel_packages_major,
+                    downlevel_packages_minor,
+                    downlevel_packages_patch,
+                    stale_packages_two_years,
+                    packages - downlevel_packages_major - downlevel_packages_minor - downlevel_packages_patch as packages_with_updates
+                FROM dataset_metrics
+                WHERE job_id = %s AND is_current = true
+                ORDER BY commit_date_time DESC
+                LIMIT 1;
+            """, (active_job_id,))
+            metrics_row = cur.fetchone()
+        else:
+            metrics_row = None
 
-        # Get finding counts by severity
-        cur.execute("SELECT COUNT(DISTINCT package_id) FROM package_critical_finding;")
-        critical_finding_count = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(DISTINCT package_id) FROM package_high_finding;")
-        high_finding_count = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(DISTINCT package_id) FROM package_medium_finding;")
-        medium_finding_count = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(DISTINCT package_id) FROM package_low_finding;")
-        low_finding_count = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(*) FROM finding;")
-        total_findings = cur.fetchone()[0]
-
-        # Get package health metrics
-        cur.execute("""
-            SELECT
-                COUNT(*) as total_packages,
-                COUNT(CASE WHEN number_major_versions_behind_head > 0 THEN 1 END) as major_behind,
-                COUNT(CASE WHEN number_minor_versions_behind_head > 0 THEN 1 END) as minor_behind,
-                COUNT(CASE WHEN number_patch_versions_behind_head > 0 THEN 1 END) as patch_behind,
-                COUNT(CASE WHEN this_version_published_at < NOW() - INTERVAL '2 years' THEN 1 END) as stale_packages,
-                COUNT(CASE WHEN most_recent_version_published_at IS NOT NULL THEN 1 END) as packages_with_updates
-            FROM package;
-        """)
-        package_metrics = cur.fetchone()
+        if metrics_row:
+            critical_finding_count = metrics_row[0] or 0
+            high_finding_count = metrics_row[1] or 0
+            medium_finding_count = metrics_row[2] or 0
+            low_finding_count = metrics_row[3] or 0
+            total_findings = metrics_row[4] or 0
+            package_count = metrics_row[5] or 0
+            packages_with_findings = metrics_row[6] or 0
+            major_behind = metrics_row[7] or 0
+            minor_behind = metrics_row[8] or 0
+            patch_behind = metrics_row[9] or 0
+            stale_packages = metrics_row[10] or 0
+            packages_with_updates = metrics_row[11] or 0
+            package_metrics = (package_count, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates)
+        else:
+            # Fallback if no dataset_metrics exist
+            critical_finding_count = 0
+            high_finding_count = 0
+            medium_finding_count = 0
+            low_finding_count = 0
+            total_findings = 0
+            package_count = 0
+            packages_with_findings = 0
+            package_metrics = (0, 0, 0, 0, 0, 0)
 
         cur.close()
         conn.close()
@@ -237,7 +270,7 @@ def get_container_stats():
 
         stats = []
         for container in containers:
-            # Get stats
+            # Get stats (this blocks briefly per container)
             container_stats = container.stats(stream=False)
 
             # Calculate CPU percentage
@@ -247,7 +280,9 @@ def get_container_stats():
                           container_stats['precpu_stats']['system_cpu_usage']
             cpu_percent = 0.0
             if system_delta > 0 and cpu_delta > 0:
-                num_cpus = len(container_stats['cpu_stats']['cpu_usage'].get('percpu_usage', [1]))
+                num_cpus = container_stats['cpu_stats'].get('online_cpus')
+                if not num_cpus:
+                    num_cpus = len(container_stats['cpu_stats']['cpu_usage'].get('percpu_usage', []))
                 if num_cpus == 0:
                     num_cpus = 1
                 cpu_percent = (cpu_delta / system_delta) * num_cpus * 100
