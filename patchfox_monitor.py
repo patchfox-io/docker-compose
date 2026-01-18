@@ -102,55 +102,59 @@ def get_dataset_info():
         dataset_status = dataset['status']
         dataset_updated_at = dataset.get('updatedAt')
 
-        # Get all events that are actively processing to find the most common job_id
-        # DQ API doesn't support GROUP BY, so we need to fetch and process client-side
-        active_events, _ = dq_query('datasourceEvent', {
-            'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING'
-        })
+        # Query database directly for all active job IDs and their counts
+        # Can't use DQ API for GROUP BY, so use direct DB connection
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT job_id, COUNT(*) as count
+                FROM datasource_event
+                WHERE status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING')
+                  AND job_id IS NOT NULL
+                GROUP BY job_id
+                ORDER BY count DESC
+            """)
+            job_id_rows = cur.fetchall()
+            cur.close()
+            conn.close()
 
-        # Count job_ids to find the most active one
-        job_id_counts = {}
-        for event in active_events:
-            job_id = event.get('jobId')
-            if job_id:
-                job_id_counts[job_id] = job_id_counts.get(job_id, 0) + 1
+            job_id_counts = {row[0]: row[1] for row in job_id_rows}
+            active_job_ids = [row[0] for row in job_id_rows]
+        except Exception as e:
+            console.print(f"[red]Error fetching job IDs: {e}[/red]")
+            job_id_counts = {}
+            active_job_ids = []
 
-        active_job_id = max(job_id_counts.keys(), key=lambda k: job_id_counts[k]) if job_id_counts else None
-
-        if active_job_id:
-            # Get total count of all events for this job
-            _, total_job_events = dq_query('datasourceEvent', {'jobId': active_job_id})
-
+        if active_job_ids:
             # Get counts for each status separately using totalElements
-            _, processing_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'PROCESSING'})
-            _, ready_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'READY_FOR_PROCESSING'})
-            _, ready_next_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'READY_FOR_NEXT_PROCESSING'})
-            _, processed_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'PROCESSED'})
-            _, error_count = dq_query('datasourceEvent', {'jobId': active_job_id, 'status': 'PROCESSING_ERROR'})
+            _, processing_count = dq_query('datasourceEvent', {'status': 'PROCESSING'})
+            _, ready_count = dq_query('datasourceEvent', {'status': 'READY_FOR_PROCESSING'})
+            _, ready_next_count = dq_query('datasourceEvent', {'status': 'READY_FOR_NEXT_PROCESSING'})
+            _, processed_count = dq_query('datasourceEvent', {'status': 'PROCESSED'})
+            _, error_count = dq_query('datasourceEvent', {'status': 'PROCESSING_ERROR'})
+
+            # Total events = sum of all statuses
+            total_job_events = processing_count + ready_count + ready_next_count + processed_count + error_count
 
             # Get enrichment progress counts using boolean field filters
             _, oss_done = dq_query('datasourceEvent', {
-                'jobId': active_job_id,
                 'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
                 'ossEnriched': 'true'
             })
             _, pkg_done = dq_query('datasourceEvent', {
-                'jobId': active_job_id,
                 'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
                 'packageIndexEnriched': 'true'
             })
             _, analyzed_done = dq_query('datasourceEvent', {
-                'jobId': active_job_id,
                 'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
                 'analyzed': 'true'
             })
             _, forecasted_done = dq_query('datasourceEvent', {
-                'jobId': active_job_id,
                 'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
                 'forecasted': 'true'
             })
             _, recommended_done = dq_query('datasourceEvent', {
-                'jobId': active_job_id,
                 'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
                 'recommended': 'true'
             })
@@ -173,6 +177,8 @@ def get_dataset_info():
             total_active = processing_count + ready_count + ready_next_count
             progress = (total_active, oss_done, pkg_done, analyzed_done, forecasted_done, recommended_done)
         else:
+            active_job_ids = []
+            job_id_counts = {}
             active_event_counts = {}
             all_event_counts = {}
             total_job_events = 0
@@ -183,19 +189,15 @@ def get_dataset_info():
         datasources, total_datasources = dq_query('datasource')
         datasource_count = total_datasources
 
-        # Get findings and package metrics from latest dataset_metrics snapshot for current job
-        if active_job_id:
-            metrics, _ = dq_query('datasetMetrics', {
-                'jobId': active_job_id,
-                'isCurrent': 'true'
-            })
+        # Get findings and package metrics from latest dataset_metrics snapshot
+        metrics, _ = dq_query('datasetMetrics', {
+            'isCurrent': 'true'
+        })
 
-            # Sort by commitDateTime DESC to get most recent commit's metrics
-            if metrics:
-                metrics.sort(key=lambda x: x.get('commitDateTime', ''), reverse=True)
-                metrics_row = metrics[0]
-            else:
-                metrics_row = None
+        # Sort by commitDateTime DESC to get most recent commit's metrics
+        if metrics:
+            metrics.sort(key=lambda x: x.get('commitDateTime', ''), reverse=True)
+            metrics_row = metrics[0]
         else:
             metrics_row = None
 
@@ -229,10 +231,11 @@ def get_dataset_info():
             'name': dataset_name,
             'status': dataset_status,
             'updated_at': dataset_updated_at,
-            'active_job_id': active_job_id,
+            'active_job_ids': active_job_ids,
+            'job_id_counts': job_id_counts,
             'active_event_counts': active_event_counts,
             'all_event_counts': all_event_counts,
-            'total_events': total_job_events if active_job_id else 0,
+            'total_events': total_job_events,
             'progress': progress,
             'error_count': error_count,
             'datasource_count': datasource_count,
@@ -397,10 +400,23 @@ def create_pipeline_status_panel(dataset_info, peristalsis_state=None):
         f"[bold {status_color}]{dataset_info['name']}[/] ([{status_color}]{dataset_info['status']}[/])"
     )
 
-    # Show active job_id if available
-    if dataset_info.get('active_job_id'):
-        job_id_str = str(dataset_info['active_job_id'])[:8]  # Show first 8 chars of UUID
-        table.add_row("Job ID:", f"[cyan]{job_id_str}...[/]")
+    # Show all active job_ids if available
+    active_job_ids = dataset_info.get('active_job_ids', [])
+    job_id_counts = dataset_info.get('job_id_counts', {})
+
+    if active_job_ids:
+        if len(active_job_ids) == 1:
+            # Single job - show full UUID
+            job_id = active_job_ids[0]
+            count = job_id_counts.get(job_id, 0)
+            table.add_row("Job ID:", f"[cyan]{job_id}[/] ({count:,} events)")
+        else:
+            # Multiple jobs - show all with counts
+            table.add_row(f"Active Jobs ({len(active_job_ids)}):", "")
+            for idx, job_id in enumerate(active_job_ids, 1):
+                count = job_id_counts.get(job_id, 0)
+                table.add_row(f"  Job {idx}:", f"[cyan]{job_id}[/]")
+                table.add_row(f"    Events:", f"[yellow]{count:,}[/]")
 
     # Show peristalsis state
     if peristalsis_state is not None:
