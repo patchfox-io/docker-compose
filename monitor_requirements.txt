@@ -2,3 +2,4 @@ rich
 docker
 psutil
 requests
+psycopg2-binary
