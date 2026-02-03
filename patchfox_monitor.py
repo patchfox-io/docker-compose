@@ -214,6 +214,8 @@ def get_dataset_info():
             patch_behind = metrics_row.get('downlevelPackagesPatch') or 0
             stale_packages = metrics_row.get('stalePackagesTwoYears') or 0
             packages_with_updates = package_count - major_behind - minor_behind - patch_behind
+            rps_score = metrics_row.get('rpsScore')
+            pes_score = metrics_row.get('patchEfficacyScore')
             package_metrics = (package_count, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates)
         else:
             # Fallback if no dataset_metrics exist
@@ -224,6 +226,8 @@ def get_dataset_info():
             total_findings = 0
             package_count = 0
             packages_with_findings = 0
+            rps_score = None
+            pes_score = None
             package_metrics = (0, 0, 0, 0, 0, 0)
 
         return {
@@ -247,7 +251,9 @@ def get_dataset_info():
                 'medium': medium_finding_count,
                 'low': low_finding_count
             },
-            'package_metrics': package_metrics
+            'package_metrics': package_metrics,
+            'rps_score': rps_score,
+            'pes_score': pes_score
         }
     except Exception as e:
         return {'error': str(e)}
@@ -272,13 +278,18 @@ def get_postgres_stats():
         conn = get_db_connection()
         cur = conn.cursor()
 
+        # Get connections grouped by application and state
         cur.execute("""
-            SELECT state, count(*)
+            SELECT
+                COALESCE(application_name, 'unknown') as app_name,
+                state,
+                count(*)
             FROM pg_stat_activity
             WHERE datname = 'mrs_db'
-            GROUP BY state;
+            GROUP BY application_name, state
+            ORDER BY application_name, state;
         """)
-        conn_stats = dict(cur.fetchall())
+        conn_by_app = cur.fetchall()
 
         cur.execute("""
             SELECT COUNT(*)
@@ -291,7 +302,7 @@ def get_postgres_stats():
         conn.close()
 
         return {
-            'conn_stats': conn_stats,
+            'conn_by_app': conn_by_app,
             'active_queries': active_queries
         }
     except Exception as e:
@@ -544,13 +555,30 @@ def create_package_health_panel(dataset_info):
     table.add_row("T Stale (>2yr):", f"[dim]{stale_packages:,}[/]")
     table.add_row("✨ Has Updates:", f"[cyan]{packages_with_updates:,}[/]")
 
+    # Add RPS and PES scores
+    table.add_row("", "")
+    rps = dataset_info.get('rps_score')
+    pes = dataset_info.get('pes_score')
+
+    if rps is not None:
+        rps_color = 'green' if rps >= 70 else 'yellow' if rps >= 40 else 'red'
+        table.add_row("📊 RPS Score:", f"[{rps_color}]{rps:.1f}[/]")
+    else:
+        table.add_row("📊 RPS Score:", "[dim]N/A[/]")
+
+    if pes is not None:
+        pes_color = 'green' if pes >= 70 else 'yellow' if pes >= 40 else 'red'
+        table.add_row("📊 PES Score:", f"[{pes_color}]{pes:.1f}[/]")
+    else:
+        table.add_row("📊 PES Score:", "[dim]N/A[/]")
+
     # Calculate percentage downlevel
     if total_packages > 0:
         downlevel_pct = ((major_behind + minor_behind + patch_behind) / total_packages) * 100
         table.add_row("", "")
         table.add_row("📉 Downlevel %:", f"[{'red' if downlevel_pct > 50 else 'yellow' if downlevel_pct > 25 else 'green'}]{downlevel_pct:.1f}%[/]")
 
-    return Panel(table, title="[ Findings & Package Health", border_style="yellow", box=box.ROUNDED)
+    return Panel(table, title="[ Dataset Metrics", border_style="yellow", box=box.ROUNDED)
 
 
 
@@ -589,14 +617,41 @@ def create_postgres_panel(pg_stats):
         return Panel(f"[red]Error: {pg_stats['error']}[/]", title="P PostgreSQL", border_style="red")
 
     table = Table.grid(padding=(0, 2))
-    table.add_column(style="cyan", width=25)
-    table.add_column()
+    table.add_column(style="cyan", width=15)
+    table.add_column(justify="right")
 
-    conn_stats = pg_stats.get('conn_stats', {})
+    conn_by_app = pg_stats.get('conn_by_app', [])
 
-    table.add_row("Active:", f"[yellow]{conn_stats.get('active', 0)}[/]")
-    table.add_row("Idle:", f"[green]{conn_stats.get('idle', 0)}[/]")
-    table.add_row("Idle in TX:", f"[red]{conn_stats.get('idle in transaction', 0)}[/]")
+    # Group connections by state, aggregating by service
+    state_totals = {}
+    state_services = {}
+
+    for app_name, state, count in conn_by_app:
+        # Aggregate by state total
+        state_totals[state] = state_totals.get(state, 0) + count
+
+        # Track service breakdown
+        if state not in state_services:
+            state_services[state] = {}
+        short_name = app_name.replace('-service', '').replace('analyze', 'anl').replace('orchestrate', 'orch').replace('unknown', 'unk')
+        state_services[state][short_name] = state_services[state].get(short_name, 0) + count
+
+    # Display each state with app breakdown
+    for state in ['active', 'idle', 'idle in transaction']:
+        state_label = state.replace('active', 'Active').replace('idle', 'Idle').replace('idle in transaction', 'Idle in TX')
+        state_color = 'yellow' if state == 'active' else 'red' if 'transaction' in state else 'green'
+
+        if state in state_totals:
+            # Show breakdown for active and idle in transaction, but not idle
+            if state == 'idle':
+                table.add_row(f"{state_label}:", f"[{state_color}]{state_totals[state]}[/]")
+            else:
+                breakdown = ', '.join([f"{svc}:{cnt}" for svc, cnt in sorted(state_services[state].items())])
+                table.add_row(f"{state_label}:", f"[{state_color}]{state_totals[state]}[/] [dim]({breakdown})[/]")
+        else:
+            table.add_row(f"{state_label}:", "[dim]0[/]")
+
+    table.add_row("", "")
     table.add_row("Active Queries:", f"[cyan]{pg_stats.get('active_queries', 0)}[/]")
 
     return Panel(table, title="P PostgreSQL", border_style="magenta", box=box.ROUNDED)

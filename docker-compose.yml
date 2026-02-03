@@ -120,7 +120,7 @@ services:
       POSTGRES_PASSWORD: omnomdata
       POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
     depends_on:
       postgres:
         condition: service_healthy
@@ -160,7 +160,7 @@ services:
       POSTGRES_PASSWORD: omnomdata
       POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
     depends_on:
       postgres:
         condition: service_healthy
@@ -294,7 +294,7 @@ services:
       POSTGRES_PASSWORD: omnomdata
       POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
     depends_on:
       postgres:
         condition: service_healthy
@@ -317,27 +317,27 @@ services:
       kafka:
         condition: service_started
 
-  recommend-service:
-    image: recommend-service:latest
-    ports:
-      - 1709:8080
-    environment:                                                                
-      POSTGRES_USER: mr_data                                                    
-      POSTGRES_PASSWORD: omnomdata                                              
-      POSTGRES_DB: mrs_db  
-      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db      
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s   
-    depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_started
+  # recommend-service:
+  #   image: recommend-service:latest
+  #   ports:
+  #     - 1709:8080
+  #   environment:
+  #     POSTGRES_USER: mr_data
+  #     POSTGRES_PASSWORD: omnomdata
+  #     POSTGRES_DB: mrs_db
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/ping"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 40s
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
 
   # databricks-dummy-service:
   #   image: databricks-dummy-service:latest
@@ -355,20 +355,20 @@ services:
   #     kafka:
   #       condition: service_started
 
-  databricks-service:
-    image: leah
-    environment:
-      POSTGRES_USER: mr_data
-      POSTGRES_PASSWORD: omnomdata
-      POSTGRES_DB: mrs_db
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
-    depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_started
-      recommend-service:
-        condition: service_healthy
+  # databricks-service:
+  #   image: leah
+  #   environment:
+  #     POSTGRES_USER: mr_data
+  #     POSTGRES_PASSWORD: omnomdata
+  #     POSTGRES_DB: mrs_db
+  #     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_started
+  #     recommend-service:
+  #       condition: service_healthy
 
   # patch-ui:
   #   image: registry.gitlab.com/patchfox2/patch-ui:develop
