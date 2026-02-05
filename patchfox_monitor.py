@@ -329,6 +329,8 @@ def get_container_stats():
         def get_single_container_stats(container):
             """Get stats for a single container"""
             try:
+                # Call stats twice - first call often returns stale data
+                container.stats(stream=False)
                 container_stats = container.stats(stream=False)
 
                 # Calculate CPU percentage
@@ -345,10 +347,14 @@ def get_container_stats():
                         num_cpus = 1
                     cpu_percent = (cpu_delta / system_delta) * num_cpus * 100
 
-                # Calculate memory usage
+                # Calculate memory usage (exclude page cache like docker stats does)
                 mem_usage = container_stats['memory_stats'].get('usage', 0)
+                mem_stats = container_stats['memory_stats'].get('stats', {})
+                # Subtract inactive file cache to match docker stats display
+                inactive_file = mem_stats.get('inactive_file', 0)
+                mem_usage_actual = mem_usage - inactive_file
                 mem_limit = container_stats['memory_stats'].get('limit', 1)
-                mem_percent = (mem_usage / mem_limit) * 100 if mem_limit > 0 else 0
+                mem_percent = (mem_usage_actual / mem_limit) * 100 if mem_limit > 0 else 0
 
                 service_name = container.name.replace('docker-compose-', '').replace('-service-1', '').replace('-1', '')
 
@@ -356,7 +362,7 @@ def get_container_stats():
                     'name': service_name,
                     'status': container.status,
                     'cpu_percent': cpu_percent,
-                    'mem_usage_mb': mem_usage / (1024 * 1024),
+                    'mem_usage_mb': mem_usage_actual / (1024 * 1024),
                     'mem_percent': mem_percent
                 }
             except Exception as e:
