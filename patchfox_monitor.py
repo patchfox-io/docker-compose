@@ -21,6 +21,7 @@ from rich import box
 from rich.columns import Columns
 from rich.align import Align
 import psutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 console = Console()
 
@@ -54,6 +55,11 @@ def dq_query(table_name, params=None):
     """Query data-service DQ API - returns (content, total_elements)"""
     try:
         url = f"{DATA_SERVICE_URL}/api/v1/db/{table_name}/query"
+        # For datasourceEvent queries, exclude payload to avoid decompression overhead
+        if table_name == 'datasourceEvent':
+            if params is None:
+                params = {}
+            params['excludePayload'] = 'true'
         response = requests.get(url, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
@@ -103,7 +109,6 @@ def get_dataset_info():
         dataset_updated_at = dataset.get('updatedAt')
 
         # Query database directly for all active job IDs and their counts
-        # Can't use DQ API for GROUP BY, so use direct DB connection
         try:
             conn = get_db_connection()
             cur = conn.cursor()
@@ -127,39 +132,45 @@ def get_dataset_info():
             active_job_ids = []
 
         if active_job_ids:
-            # Get counts for each status separately using totalElements
-            _, processing_count = dq_query('datasourceEvent', {'status': 'PROCESSING'})
-            _, ready_count = dq_query('datasourceEvent', {'status': 'READY_FOR_PROCESSING'})
-            _, ready_next_count = dq_query('datasourceEvent', {'status': 'READY_FOR_NEXT_PROCESSING'})
-            _, processed_count = dq_query('datasourceEvent', {'status': 'PROCESSED'})
-            _, error_count = dq_query('datasourceEvent', {'status': 'PROCESSING_ERROR'})
+            # Parallelize all datasourceEvent queries
+            queries = [
+                ('processing', {'status': 'PROCESSING'}),
+                ('ready', {'status': 'READY_FOR_PROCESSING'}),
+                ('ready_next', {'status': 'READY_FOR_NEXT_PROCESSING'}),
+                ('processed', {'status': 'PROCESSED'}),
+                ('error', {'status': 'PROCESSING_ERROR'}),
+                ('oss_done', {'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING', 'ossEnriched': 'true'}),
+                ('pkg_done', {'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING', 'packageIndexEnriched': 'true'}),
+                ('analyzed_done', {'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING', 'analyzed': 'true'}),
+                ('forecasted_done', {'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING', 'forecasted': 'true'}),
+                ('recommended_done', {'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING', 'recommended': 'true'}),
+            ]
 
-            # Total events = sum of all statuses
+            results = {}
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_key = {executor.submit(dq_query, 'datasourceEvent', params): key for key, params in queries}
+                for future in as_completed(future_to_key):
+                    key = future_to_key[future]
+                    try:
+                        _, count = future.result()
+                        results[key] = count
+                    except Exception as e:
+                        console.print(f"[red]Error in query {key}: {e}[/red]")
+                        results[key] = 0
+
+            processing_count = results.get('processing', 0)
+            ready_count = results.get('ready', 0)
+            ready_next_count = results.get('ready_next', 0)
+            processed_count = results.get('processed', 0)
+            error_count = results.get('error', 0)
+            oss_done = results.get('oss_done', 0)
+            pkg_done = results.get('pkg_done', 0)
+            analyzed_done = results.get('analyzed_done', 0)
+            forecasted_done = results.get('forecasted_done', 0)
+            recommended_done = results.get('recommended_done', 0)
+
             total_job_events = processing_count + ready_count + ready_next_count + processed_count + error_count
 
-            # Get enrichment progress counts using boolean field filters
-            _, oss_done = dq_query('datasourceEvent', {
-                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
-                'ossEnriched': 'true'
-            })
-            _, pkg_done = dq_query('datasourceEvent', {
-                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
-                'packageIndexEnriched': 'true'
-            })
-            _, analyzed_done = dq_query('datasourceEvent', {
-                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
-                'analyzed': 'true'
-            })
-            _, forecasted_done = dq_query('datasourceEvent', {
-                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
-                'forecasted': 'true'
-            })
-            _, recommended_done = dq_query('datasourceEvent', {
-                'status': 'PROCESSING,READY_FOR_PROCESSING,READY_FOR_NEXT_PROCESSING',
-                'recommended': 'true'
-            })
-
-            # Build status counts
             active_event_counts = {
                 'PROCESSING': processing_count,
                 'READY_FOR_PROCESSING': ready_count,
@@ -315,39 +326,51 @@ def get_container_stats():
         client = docker.from_env()
         containers = client.containers.list()
 
+        def get_single_container_stats(container):
+            """Get stats for a single container"""
+            try:
+                container_stats = container.stats(stream=False)
+
+                # Calculate CPU percentage
+                cpu_delta = container_stats['cpu_stats']['cpu_usage']['total_usage'] - \
+                           container_stats['precpu_stats']['cpu_usage']['total_usage']
+                system_delta = container_stats['cpu_stats']['system_cpu_usage'] - \
+                              container_stats['precpu_stats']['system_cpu_usage']
+                cpu_percent = 0.0
+                if system_delta > 0 and cpu_delta > 0:
+                    num_cpus = container_stats['cpu_stats'].get('online_cpus')
+                    if not num_cpus:
+                        num_cpus = len(container_stats['cpu_stats']['cpu_usage'].get('percpu_usage', []))
+                    if num_cpus == 0:
+                        num_cpus = 1
+                    cpu_percent = (cpu_delta / system_delta) * num_cpus * 100
+
+                # Calculate memory usage
+                mem_usage = container_stats['memory_stats'].get('usage', 0)
+                mem_limit = container_stats['memory_stats'].get('limit', 1)
+                mem_percent = (mem_usage / mem_limit) * 100 if mem_limit > 0 else 0
+
+                service_name = container.name.replace('docker-compose-', '').replace('-service-1', '').replace('-1', '')
+
+                return {
+                    'name': service_name,
+                    'status': container.status,
+                    'cpu_percent': cpu_percent,
+                    'mem_usage_mb': mem_usage / (1024 * 1024),
+                    'mem_percent': mem_percent
+                }
+            except Exception as e:
+                return {'name': container.name, 'error': str(e)}
+
+        # Parallelize container stats collection
         stats = []
-        for container in containers:
-            # Get stats (this blocks briefly per container)
-            container_stats = container.stats(stream=False)
-
-            # Calculate CPU percentage
-            cpu_delta = container_stats['cpu_stats']['cpu_usage']['total_usage'] - \
-                       container_stats['precpu_stats']['cpu_usage']['total_usage']
-            system_delta = container_stats['cpu_stats']['system_cpu_usage'] - \
-                          container_stats['precpu_stats']['system_cpu_usage']
-            cpu_percent = 0.0
-            if system_delta > 0 and cpu_delta > 0:
-                num_cpus = container_stats['cpu_stats'].get('online_cpus')
-                if not num_cpus:
-                    num_cpus = len(container_stats['cpu_stats']['cpu_usage'].get('percpu_usage', []))
-                if num_cpus == 0:
-                    num_cpus = 1
-                cpu_percent = (cpu_delta / system_delta) * num_cpus * 100
-
-            # Calculate memory usage
-            mem_usage = container_stats['memory_stats'].get('usage', 0)
-            mem_limit = container_stats['memory_stats'].get('limit', 1)
-            mem_percent = (mem_usage / mem_limit) * 100 if mem_limit > 0 else 0
-
-            service_name = container.name.replace('docker-compose-', '').replace('-service-1', '').replace('-1', '')
-
-            stats.append({
-                'name': service_name,
-                'status': container.status,
-                'cpu_percent': cpu_percent,
-                'mem_usage_mb': mem_usage / (1024 * 1024),
-                'mem_percent': mem_percent
-            })
+        with ThreadPoolExecutor(max_workers=len(containers)) as executor:
+            futures = [executor.submit(get_single_container_stats, c) for c in containers]
+            for future in as_completed(futures):
+                try:
+                    stats.append(future.result())
+                except Exception as e:
+                    console.print(f"[red]Error getting container stats: {e}[/red]")
 
         return stats
     except Exception as e:
@@ -602,7 +625,7 @@ def create_containers_panel(container_stats):
                 stat['name'],
                 f"{status_emoji} {stat['status']}",
                 f"[{cpu_color}]{stat['cpu_percent']:.1f}%[/]",
-                f"[{mem_color}]{stat['mem_usage_mb']:.0f}MB ({stat['mem_percent']:.1f}%)[/]"
+                f"[{mem_color}]{stat['mem_usage_mb']:,.0f}MB ({stat['mem_percent']:.1f}%)[/]"
             )
     else:
         error_msg = container_stats[0].get('error', 'Unknown error') if container_stats else 'No stats'
