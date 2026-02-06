@@ -36,7 +36,7 @@ POSTGRES_PASSWORD = "omnomdata"
 
 # Status enums from db-entities
 DATASET_STATUSES = ['INITIALIZING', 'INGESTING', 'READY_FOR_PROCESSING', 'PROCESSING', 'PROCESSING_ERROR', 'IDLE']
-DATASOURCE_STATUSES = ['INITIALIZING', 'INGESTING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING', 'PROCESSING_ERROR']
+DATASOURCE_STATUSES = ['INITIALIZING', 'INGESTING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING', 'PROCESSING_ERROR', 'IDLE']
 DATASOURCE_EVENT_STATUSES = ['INGESTING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING', 'PROCESSED', 'PROCESSING_ERROR']
 
 # History tracking for sparklines
@@ -110,13 +110,14 @@ def get_job_info():
             SELECT 
                 de.job_id,
                 COUNT(*) as event_count,
-                d.updated_at as last_updated
+                d.updated_at as last_updated,
+                d.status as dataset_status
             FROM datasource_event de
             JOIN datasource ds ON ds.id = de.datasource_id
             JOIN datasource_dataset dd ON dd.datasource_id = ds.id
             JOIN dataset d ON d.id = dd.dataset_id
             WHERE de.job_id IS NOT NULL
-            GROUP BY de.job_id, d.updated_at
+            GROUP BY de.job_id, d.updated_at, d.status
             ORDER BY 
                 CASE 
                     WHEN MIN(de.status) IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING') THEN 0
@@ -127,31 +128,36 @@ def get_job_info():
         
         jobs = []
         for row in cur.fetchall():
-            job_id, event_count, last_updated = row
+            job_id, event_count, last_updated, dataset_status = row
             
-            # Determine job status based on event statuses
-            cur.execute("""
-                SELECT status, COUNT(*) 
-                FROM datasource_event 
-                WHERE job_id = %s 
-                GROUP BY status
-            """, (job_id,))
-            
-            status_counts = dict(cur.fetchall())
-            
-            # Job is PROCESSING if any events are processing/ready
-            if any(s in status_counts for s in ['PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING']):
-                job_status = 'PROCESSING'
-            elif 'PROCESSING_ERROR' in status_counts:
-                job_status = 'ERROR'
+            # Determine job status based on dataset status and event statuses
+            if dataset_status == 'IDLE':
+                job_status = 'DONE'
             else:
-                job_status = 'IDLE'
+                # Check event statuses
+                cur.execute("""
+                    SELECT status, COUNT(*) 
+                    FROM datasource_event 
+                    WHERE job_id = %s 
+                    GROUP BY status
+                """, (job_id,))
+                
+                status_counts = dict(cur.fetchall())
+                
+                # Job is PROCESSING if any events are processing/ready
+                if any(s in status_counts for s in ['PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING']):
+                    job_status = 'PROCESSING'
+                elif 'PROCESSING_ERROR' in status_counts:
+                    job_status = 'ERROR'
+                else:
+                    job_status = 'DONE'
             
             jobs.append({
                 'id': job_id,
                 'status': job_status,
                 'updated_at': last_updated,
-                'event_count': event_count
+                'event_count': event_count,
+                'dataset_status': dataset_status
             })
         
         cur.close()
@@ -164,21 +170,37 @@ def get_job_info():
 
 
 def get_job_datasource_counts(job_id):
-    """Get datasource status counts for a specific job"""
+    """Get datasource status counts for a specific job's dataset"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
+        # Get the dataset_id for this job
         cur.execute("""
-            SELECT status, COUNT(*) 
-            FROM datasource 
-            WHERE id IN (
-                SELECT DISTINCT datasource_id 
-                FROM datasource_event 
-                WHERE job_id = %s
-            )
-            GROUP BY status
+            SELECT DISTINCT dd.dataset_id
+            FROM datasource_event de
+            JOIN datasource ds ON ds.id = de.datasource_id
+            JOIN datasource_dataset dd ON dd.datasource_id = ds.id
+            WHERE de.job_id = %s
+            LIMIT 1
         """, (job_id,))
+        
+        result = cur.fetchone()
+        if not result:
+            cur.close()
+            conn.close()
+            return {status: 0 for status in DATASOURCE_STATUSES}
+        
+        dataset_id = result[0]
+        
+        # Get all datasources in this dataset with their statuses
+        cur.execute("""
+            SELECT ds.status, COUNT(*) 
+            FROM datasource ds
+            JOIN datasource_dataset dd ON dd.datasource_id = ds.id
+            WHERE dd.dataset_id = %s
+            GROUP BY ds.status
+        """, (dataset_id,))
         
         counts = {status: 0 for status in DATASOURCE_STATUSES}
         for status, count in cur.fetchall():
@@ -627,14 +649,15 @@ def create_pipeline_status_panel(dataset_info, peristalsis_state=None):
         
         # Dataset subsection
         table.add_row("  [bold]Dataset:[/]", "")
+        dataset_status = job.get('dataset_status', dataset_info['status'])
         dataset_status_color = {
             'READY_FOR_PROCESSING': 'yellow',
             'PROCESSING': 'blue',
             'IDLE': 'green',
             'ERROR': 'red'
-        }.get(dataset_info['status'], 'white')
+        }.get(dataset_status, 'white')
         table.add_row("    Name:", f"[bold]{dataset_info['name']}[/]")
-        table.add_row("    Status:", f"[{dataset_status_color}]{dataset_info['status']}[/]")
+        table.add_row("    Status:", f"[{dataset_status_color}]{dataset_status}[/]")
         table.add_row("", "")
         
         # Datasources subsection
