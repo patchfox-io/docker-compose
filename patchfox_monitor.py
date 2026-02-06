@@ -374,12 +374,14 @@ def get_dataset_info():
 
         # Get findings and package metrics from latest dataset_metrics snapshot
         metrics, _ = dq_query('datasetMetrics', {
-            'isCurrent': 'true'
+            'isCurrent': 'true',
+            'sort': 'commitDateTime.desc',
+            'size': '1'
         })
 
-        # Sort by commitDateTime DESC to get most recent commit's metrics
+        # Get most recent commit's metrics
+        # Get most recent commit's metrics
         if metrics:
-            metrics.sort(key=lambda x: x.get('commitDateTime', ''), reverse=True)
             metrics_row = metrics[0]
         else:
             metrics_row = None
