@@ -34,6 +34,11 @@ POSTGRES_DB = "mrs_db"
 POSTGRES_USER = "mr_data"
 POSTGRES_PASSWORD = "omnomdata"
 
+# Status enums from db-entities
+DATASET_STATUSES = ['INITIALIZING', 'INGESTING', 'READY_FOR_PROCESSING', 'PROCESSING', 'PROCESSING_ERROR', 'IDLE']
+DATASOURCE_STATUSES = ['INITIALIZING', 'INGESTING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING', 'PROCESSING_ERROR']
+DATASOURCE_EVENT_STATUSES = ['INGESTING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING', 'PROCESSING', 'PROCESSED', 'PROCESSING_ERROR']
+
 # History tracking for sparklines
 cpu_history = []
 mem_history = []
@@ -92,6 +97,151 @@ def create_sparkline(data, width=20, height=5):
         sparkline += bars[bar_index]
 
     return sparkline
+
+
+def get_job_info():
+    """Get all active job_ids from datasource_events with their metadata"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get all job_ids with their event counts and dataset updated_at for duration
+        cur.execute("""
+            SELECT 
+                de.job_id,
+                COUNT(*) as event_count,
+                d.updated_at as last_updated
+            FROM datasource_event de
+            JOIN datasource ds ON ds.id = de.datasource_id
+            JOIN datasource_dataset dd ON dd.datasource_id = ds.id
+            JOIN dataset d ON d.id = dd.dataset_id
+            WHERE de.job_id IS NOT NULL
+            GROUP BY de.job_id, d.updated_at
+            ORDER BY 
+                CASE 
+                    WHEN MIN(de.status) IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING') THEN 0
+                    ELSE 1
+                END,
+                d.updated_at DESC
+        """)
+        
+        jobs = []
+        for row in cur.fetchall():
+            job_id, event_count, last_updated = row
+            
+            # Determine job status based on event statuses
+            cur.execute("""
+                SELECT status, COUNT(*) 
+                FROM datasource_event 
+                WHERE job_id = %s 
+                GROUP BY status
+            """, (job_id,))
+            
+            status_counts = dict(cur.fetchall())
+            
+            # Job is PROCESSING if any events are processing/ready
+            if any(s in status_counts for s in ['PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING']):
+                job_status = 'PROCESSING'
+            elif 'PROCESSING_ERROR' in status_counts:
+                job_status = 'ERROR'
+            else:
+                job_status = 'IDLE'
+            
+            jobs.append({
+                'id': job_id,
+                'status': job_status,
+                'updated_at': last_updated,
+                'event_count': event_count
+            })
+        
+        cur.close()
+        conn.close()
+        
+        return jobs
+    except Exception as e:
+        console.print(f"[red]Error fetching jobs: {e}[/red]")
+        return []
+
+
+def get_job_datasource_counts(job_id):
+    """Get datasource status counts for a specific job"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT status, COUNT(*) 
+            FROM datasource 
+            WHERE id IN (
+                SELECT DISTINCT datasource_id 
+                FROM datasource_event 
+                WHERE job_id = %s
+            )
+            GROUP BY status
+        """, (job_id,))
+        
+        counts = {status: 0 for status in DATASOURCE_STATUSES}
+        for status, count in cur.fetchall():
+            counts[status] = count
+        
+        cur.close()
+        conn.close()
+        
+        return counts
+    except Exception as e:
+        console.print(f"[red]Error fetching datasource counts: {e}[/red]")
+        return {status: 0 for status in DATASOURCE_STATUSES}
+
+
+def get_job_datasource_event_counts(job_id):
+    """Get datasource_event status counts and enrichment flags for a specific job"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Status counts
+        cur.execute("""
+            SELECT status, COUNT(*) 
+            FROM datasource_event 
+            WHERE job_id = %s
+            GROUP BY status
+        """, (job_id,))
+        
+        status_counts = {status: 0 for status in DATASOURCE_EVENT_STATUSES}
+        for status, count in cur.fetchall():
+            status_counts[status] = count
+        
+        # Enrichment flag counts
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE oss_enriched = true) as oss_done,
+                COUNT(*) FILTER (WHERE package_index_enriched = true) as pkg_done,
+                COUNT(*) FILTER (WHERE analyzed = true) as analyzed_done,
+                COUNT(*) FILTER (WHERE forecasted = true) as forecasted_done,
+                COUNT(*) FILTER (WHERE recommended = true) as recommended_done
+            FROM datasource_event 
+            WHERE job_id = %s
+              AND status IN ('PROCESSING', 'READY_FOR_PROCESSING', 'READY_FOR_NEXT_PROCESSING')
+        """, (job_id,))
+        
+        enrichment_row = cur.fetchone()
+        enrichment = {
+            'total': enrichment_row[0] if enrichment_row else 0,
+            'oss_done': enrichment_row[1] if enrichment_row else 0,
+            'pkg_done': enrichment_row[2] if enrichment_row else 0,
+            'analyzed_done': enrichment_row[3] if enrichment_row else 0,
+            'forecasted_done': enrichment_row[4] if enrichment_row else 0,
+            'recommended_done': enrichment_row[5] if enrichment_row else 0
+        }
+        
+        cur.close()
+        conn.close()
+        
+        return status_counts, enrichment
+    except Exception as e:
+        console.print(f"[red]Error fetching datasource_event counts: {e}[/red]")
+        return {status: 0 for status in DATASOURCE_EVENT_STATUSES}, {'total': 0, 'oss_done': 0, 'pkg_done': 0, 'analyzed_done': 0, 'forecasted_done': 0, 'recommended_done': 0}
 
 
 def get_dataset_info():
@@ -412,137 +562,141 @@ def get_host_stats():
 
 
 def create_pipeline_status_panel(dataset_info, peristalsis_state=None):
-    """Create comprehensive pipeline status panel"""
+    """Create comprehensive pipeline status panel organized by jobs"""
     if not dataset_info or 'error' in dataset_info:
         return Panel(f"⚠️  Unable to fetch dataset info: {dataset_info.get('error', 'Unknown error')}",
                     title="Pipeline Status", border_style="red")
 
-    progress = dataset_info['progress']
-    if not progress:
-        return Panel("⚠️  No progress data available", title="Pipeline Status", border_style="red")
-
-    total, oss_done, pkg_done, analyzed_done, forecasted_done, recommended_done = progress
-
     table = Table.grid(padding=(0, 2))
-    table.add_column(style="cyan", width=25)
+    table.add_column(style="cyan", width=30)
     table.add_column()
 
-    # Dataset info
-    status_color = {
-        'READY_FOR_PROCESSING': 'yellow',
-        'PROCESSING': 'blue',
-        'COMPLETE': 'green',
-        'ERROR': 'red'
-    }.get(dataset_info['status'], 'white')
-
-    table.add_row(
-        "[ Dataset:",
-        f"[bold {status_color}]{dataset_info['name']}[/] ([{status_color}]{dataset_info['status']}[/])"
-    )
-
-    # Show all active job_ids if available
-    active_job_ids = dataset_info.get('active_job_ids', [])
-    job_id_counts = dataset_info.get('job_id_counts', {})
-
-    if active_job_ids:
-        if len(active_job_ids) == 1:
-            # Single job - show full UUID
-            job_id = active_job_ids[0]
-            count = job_id_counts.get(job_id, 0)
-            table.add_row("Job ID:", f"[cyan]{job_id}[/] ({count:,} events)")
-        else:
-            # Multiple jobs - show all with counts
-            table.add_row(f"Active Jobs ({len(active_job_ids)}):", "")
-            for idx, job_id in enumerate(active_job_ids, 1):
-                count = job_id_counts.get(job_id, 0)
-                table.add_row(f"  Job {idx}:", f"[cyan]{job_id}[/]")
-                table.add_row(f"    Events:", f"[yellow]{count:,}[/]")
-
-    # Show peristalsis state
+    # ===== ORCHESTRATE SECTION =====
+    table.add_row("[bold yellow]═══ ORCHESTRATE ═══[/]", "")
     if peristalsis_state is not None:
         peristalsis_color = "green" if peristalsis_state else "red"
         peristalsis_text = "ON" if peristalsis_state else "OFF"
-        table.add_row("~ Peristalsis:", f"[{peristalsis_color}]{peristalsis_text}[/]")
+        table.add_row("  Peristalsis:", f"[{peristalsis_color}]{peristalsis_text}[/]")
     else:
-        table.add_row("~ Peristalsis:", "[dim]Unknown[/]")
-
-    # Show job duration only when actively processing
-    if dataset_info['status'] == 'PROCESSING' and dataset_info.get('updated_at'):
-        try:
-            updated_at = parser.isoparse(dataset_info['updated_at'])
-            now = datetime.now(updated_at.tzinfo)
-            duration = now - updated_at
-
-            # Format duration
-            total_seconds = int(duration.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-
-            if hours > 0:
-                duration_str = f"{hours}h {minutes}m {seconds}s"
-            elif minutes > 0:
-                duration_str = f"{minutes}m {seconds}s"
-            else:
-                duration_str = f"{seconds}s"
-
-            table.add_row("T Job Duration:", f"[yellow]{duration_str}[/]")
-        except Exception as e:
-            # If parsing fails, silently skip duration display
-            pass
-
+        table.add_row("  Peristalsis:", "[dim]Unknown[/]")
     table.add_row("", "")
 
-    # Event status breakdown
-    active_counts = dataset_info['active_event_counts']
-    processing = active_counts.get('PROCESSING', 0)
-    ready = active_counts.get('READY_FOR_PROCESSING', 0)
-    ready_next = active_counts.get('READY_FOR_NEXT_PROCESSING', 0)
-    errors = dataset_info['error_count']
+    # Get all jobs
+    jobs = get_job_info()
+    
+    if not jobs:
+        table.add_row("[dim]No active jobs[/]", "")
+        return Panel(table, title="> Pipeline Status", border_style="green", box=box.ROUNDED)
 
-    table.add_row("⚡ Processing:", f"[yellow]{processing:,}[/]")
-    table.add_row("⏳ Ready:", f"[cyan]{ready:,}[/]")
-    table.add_row("~ Ready Next:", f"[blue]{ready_next:,}[/]")
-    table.add_row("❌ Errors:", f"[red]{errors:,}[/]")
-    table.add_row("", "")
-
-    # Total events by status
-    all_counts = dataset_info['all_event_counts']
-    processed = all_counts.get('PROCESSED', 0)
-    total_events = dataset_info.get('total_events', 0)
-
-    table.add_row("✅ Processed:", f"[green]{processed:,}[/]")
-    table.add_row("📈 Total Events:", f"[bold cyan]{total_events:,}[/]")
-    table.add_row("", "")
-
-    # Progress bars for active processing
-    if total > 0:
-        oss_pct = (oss_done / total * 100)
-        pkg_pct = (pkg_done / total * 100)
-        analyzed_pct = (analyzed_done / total * 100)
-        forecasted_pct = (forecasted_done / total * 100)
-        recommended_pct = (recommended_done / total * 100)
-
-        table.add_row(
-            "🔍 OSS Enriched:",
-            f"[{'green' if oss_pct == 100 else 'yellow'}]{oss_done:,}/{total:,}[/] ({oss_pct:.1f}%)"
-        )
-        table.add_row(
-            "* Package Indexed:",
-            f"[{'green' if pkg_pct == 100 else 'yellow'}]{pkg_done:,}/{total:,}[/] ({pkg_pct:.1f}%)"
-        )
-        table.add_row(
-            "🧪 Analyzed:",
-            f"[{'green' if analyzed_pct == 100 else 'yellow'}]{analyzed_done:,}/{total:,}[/] ({analyzed_pct:.1f}%)"
-        )
-        table.add_row(
-            "🔮 Forecasted:",
-            f"[{'green' if forecasted_pct == 100 else 'yellow'}]{forecasted_done:,}/{total:,}[/] ({forecasted_pct:.1f}%)"
-        )
-        table.add_row(
-            "💡 Recommended:",
-            f"[{'green' if recommended_pct == 100 else 'yellow'}]{recommended_done:,}/{total:,}[/] ({recommended_pct:.1f}%)"
-        )
+    # ===== JOB SECTIONS =====
+    for idx, job in enumerate(jobs):
+        job_id = job['id']
+        job_status = job['status']
+        updated_at = job['updated_at']
+        
+        # Job header
+        job_status_color = "yellow" if job_status == 'PROCESSING' else "green" if job_status == 'IDLE' else "cyan"
+        table.add_row(f"[bold {job_status_color}]═══ JOB {idx + 1} - {job_status} ═══[/]", "")
+        
+        # Job Status subsection
+        table.add_row("  [bold]Job Status:[/]", "")
+        table.add_row("    Job ID:", f"[cyan]{job_id}[/]")
+        
+        # Job duration
+        if updated_at:
+            try:
+                now = datetime.now(updated_at.tzinfo) if updated_at.tzinfo else datetime.now()
+                duration = now - updated_at
+                total_seconds = int(duration.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                seconds = total_seconds % 60
+                
+                if hours > 0:
+                    duration_str = f"{hours}h {minutes}m {seconds}s"
+                elif minutes > 0:
+                    duration_str = f"{minutes}m {seconds}s"
+                else:
+                    duration_str = f"{seconds}s"
+                
+                table.add_row("    Duration:", f"[yellow]{duration_str}[/]")
+            except:
+                pass
+        
+        table.add_row("", "")
+        
+        # Dataset subsection
+        table.add_row("  [bold]Dataset:[/]", "")
+        dataset_status_color = {
+            'READY_FOR_PROCESSING': 'yellow',
+            'PROCESSING': 'blue',
+            'IDLE': 'green',
+            'ERROR': 'red'
+        }.get(dataset_info['status'], 'white')
+        table.add_row("    Name:", f"[bold]{dataset_info['name']}[/]")
+        table.add_row("    Status:", f"[{dataset_status_color}]{dataset_info['status']}[/]")
+        table.add_row("", "")
+        
+        # Datasources subsection
+        table.add_row("  [bold]Datasources:[/]", "")
+        datasource_counts = get_job_datasource_counts(job_id)
+        for status in DATASOURCE_STATUSES:
+            count = datasource_counts.get(status, 0)
+            status_color = "yellow" if status == 'PROCESSING' else "cyan" if 'READY' in status else "red" if 'ERROR' in status else "green"
+            table.add_row(f"    {status}:", f"[{status_color}]{count:,}[/]")
+        table.add_row("", "")
+        
+        # Datasource Events subsection
+        table.add_row("  [bold]Datasource Events:[/]", "")
+        event_counts, enrichment = get_job_datasource_event_counts(job_id)
+        
+        # Status breakdown
+        for status in DATASOURCE_EVENT_STATUSES:
+            count = event_counts.get(status, 0)
+            status_color = "yellow" if status == 'PROCESSING' else "cyan" if 'READY' in status else "green" if status == 'PROCESSED' else "red"
+            table.add_row(f"    {status}:", f"[{status_color}]{count:,}[/]")
+        
+        table.add_row("", "")
+        
+        # Enrichment progress
+        total = enrichment['total']
+        if total > 0:
+            oss_done = enrichment['oss_done']
+            pkg_done = enrichment['pkg_done']
+            analyzed_done = enrichment['analyzed_done']
+            forecasted_done = enrichment['forecasted_done']
+            recommended_done = enrichment['recommended_done']
+            
+            oss_pct = (oss_done / total * 100)
+            pkg_pct = (pkg_done / total * 100)
+            analyzed_pct = (analyzed_done / total * 100)
+            forecasted_pct = (forecasted_done / total * 100)
+            recommended_pct = (recommended_done / total * 100)
+            
+            table.add_row(
+                "    🔍 OSS Enriched:",
+                f"[{'green' if oss_pct == 100 else 'yellow'}]{oss_done:,}/{total:,}[/] ({oss_pct:.1f}%)"
+            )
+            table.add_row(
+                "    📦 Package Indexed:",
+                f"[{'green' if pkg_pct == 100 else 'yellow'}]{pkg_done:,}/{total:,}[/] ({pkg_pct:.1f}%)"
+            )
+            table.add_row(
+                "    🧪 Analyzed:",
+                f"[{'green' if analyzed_pct == 100 else 'yellow'}]{analyzed_done:,}/{total:,}[/] ({analyzed_pct:.1f}%)"
+            )
+            table.add_row(
+                "    🔮 Forecasted:",
+                f"[{'green' if forecasted_pct == 100 else 'yellow'}]{forecasted_done:,}/{total:,}[/] ({forecasted_pct:.1f}%)"
+            )
+            table.add_row(
+                "    💡 Recommended:",
+                f"[{'green' if recommended_pct == 100 else 'yellow'}]{recommended_done:,}/{total:,}[/] ({recommended_pct:.1f}%)"
+            )
+        
+        # Add spacing between jobs
+        if idx < len(jobs) - 1:
+            table.add_row("", "")
 
     return Panel(table, title="> Pipeline Status", border_style="green", box=box.ROUNDED)
 
