@@ -111,6 +111,12 @@ services:
       start_period: 30s
       timeout: 10s
 
+  redis:
+    image: redis:alpine
+    ports:
+      - 6379:6379
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+
   analyze-service:
     image: analyze-service:latest
     ports:
@@ -121,10 +127,14 @@ services:
       POSTGRES_DB: mrs_db
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_started
+      redis:
         condition: service_started
 
 
