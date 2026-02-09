@@ -387,6 +387,7 @@ def get_dataset_info():
             metrics_row = None
 
         if metrics_row:
+            commit_date_time = metrics_row.get('commitDateTime')
             critical_finding_count = metrics_row.get('criticalFindings') or 0
             high_finding_count = metrics_row.get('highFindings') or 0
             medium_finding_count = metrics_row.get('mediumFindings') or 0
@@ -515,6 +516,7 @@ def get_dataset_info():
             finding_instances = {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
             finding_backlog = {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
             package_types = {}
+            commit_date_time = None
 
         return {
             'id': dataset_id,
@@ -542,7 +544,8 @@ def get_dataset_info():
             'package_types': package_types,
             'package_metrics': package_metrics,
             'rps_score': rps_score,
-            'pes_score': pes_score
+            'pes_score': pes_score,
+            'commit_date_time': commit_date_time
         }
     except Exception as e:
         return {'error': str(e)}
@@ -844,12 +847,22 @@ def create_package_health_panel(dataset_info):
     finding_instances = dataset_info.get('finding_instances', {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0})
     finding_backlog = dataset_info.get('finding_backlog', {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0})
     package_types = dataset_info.get('package_types', {})
+    commit_date_time = dataset_info.get('commit_date_time')
 
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan", width=25)
     table.add_column(justify="right", width=12)
     table.add_column(justify="right", width=12)
     table.add_column(justify="right", width=12)
+
+    # COMMIT DATE TIME SECTION
+    table.add_row("[bold yellow]═══ COMMIT DATE TIME ═══[/]", "", "", "")
+    if commit_date_time:
+        table.add_row(f"[cyan]{commit_date_time}[/]", "", "", "")
+    else:
+        table.add_row("[dim]N/A[/]", "", "", "")
+    table.add_row("", "", "", "")
+    table.add_row("", "", "", "")
 
     # FINDINGS SECTION
     table.add_row("[bold yellow]═══ FINDINGS ═══[/]", "", "", "")
