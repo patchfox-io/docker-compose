@@ -402,6 +402,104 @@ def get_dataset_info():
             rps_score = metrics_row.get('rpsScore')
             pes_score = metrics_row.get('patchEfficacyScore')
             package_metrics = (package_count, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates)
+            
+            # Extract backlog metrics
+            backlog_30_60 = metrics_row.get('findingsInBacklogBetweenThirtyAndSixtyDays') or 0
+            backlog_60_90 = metrics_row.get('findingsInBacklogBetweenSixtyAndNinetyDays') or 0
+            backlog_90_plus = metrics_row.get('findingsInBacklogOverNinetyDays') or 0
+            
+            critical_backlog_30_60 = metrics_row.get('criticalFindingsInBacklogBetweenThirtyAndSixtyDays') or 0
+            critical_backlog_60_90 = metrics_row.get('criticalFindingsInBacklogBetweenSixtyAndNinetyDays') or 0
+            critical_backlog_90_plus = metrics_row.get('criticalFindingsInBacklogOverNinetyDays') or 0
+            
+            high_backlog_30_60 = metrics_row.get('highFindingsInBacklogBetweenThirtyAndSixtyDays') or 0
+            high_backlog_60_90 = metrics_row.get('highFindingsInBacklogBetweenSixtyAndNinetyDays') or 0
+            high_backlog_90_plus = metrics_row.get('highFindingsInBacklogOverNinetyDays') or 0
+            
+            medium_backlog_30_60 = metrics_row.get('mediumFindingsInBacklogBetweenThirtyAndSixtyDays') or 0
+            medium_backlog_60_90 = metrics_row.get('mediumFindingsInBacklogBetweenSixtyAndNinetyDays') or 0
+            medium_backlog_90_plus = metrics_row.get('mediumFindingsInBacklogOverNinetyDays') or 0
+            
+            low_backlog_30_60 = metrics_row.get('lowFindingsInBacklogBetweenThirtyAndSixtyDays') or 0
+            low_backlog_60_90 = metrics_row.get('lowFindingsInBacklogBetweenSixtyAndNinetyDays') or 0
+            low_backlog_90_plus = metrics_row.get('lowFindingsInBacklogOverNinetyDays') or 0
+            
+            finding_backlog = {
+                'total': backlog_30_60 + backlog_60_90 + backlog_90_plus,
+                'critical': critical_backlog_30_60 + critical_backlog_60_90 + critical_backlog_90_plus,
+                'high': high_backlog_30_60 + high_backlog_60_90 + high_backlog_90_plus,
+                'medium': medium_backlog_30_60 + medium_backlog_60_90 + medium_backlog_90_plus,
+                'low': low_backlog_30_60 + low_backlog_60_90 + low_backlog_90_plus
+            }
+            
+            # Get package types from package_indexes
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    WITH latest_metrics AS (
+                        SELECT package_indexes
+                        FROM dataset_metrics 
+                        WHERE is_current = true
+                        ORDER BY commit_date_time DESC 
+                        LIMIT 1
+                    )
+                    SELECT p.type, COUNT(*) as count
+                    FROM latest_metrics,
+                         unnest(package_indexes) AS package_id
+                    JOIN package p ON p.id = package_id
+                    GROUP BY p.type
+                    ORDER BY count DESC
+                """)
+                package_types = {row[0]: row[1] for row in cur.fetchall()}
+                cur.close()
+                conn.close()
+            except Exception as e:
+                console.print(f"[red]Error fetching package types: {e}[/red]")
+                package_types = {}
+            
+            # Get finding instances (not just types) by unnesting package_indexes
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    WITH latest_metrics AS (
+                        SELECT package_indexes
+                        FROM dataset_metrics 
+                        WHERE is_current = true
+                        ORDER BY commit_date_time DESC 
+                        LIMIT 1
+                    )
+                    SELECT 
+                        COUNT(f.id) as total,
+                        COUNT(f.id) FILTER (WHERE fd.severity = 'CRITICAL') as critical,
+                        COUNT(f.id) FILTER (WHERE fd.severity = 'HIGH') as high,
+                        COUNT(f.id) FILTER (WHERE fd.severity = 'MEDIUM') as medium,
+                        COUNT(f.id) FILTER (WHERE fd.severity = 'LOW') as low
+                    FROM latest_metrics,
+                         unnest(package_indexes) AS package_id
+                    JOIN package p ON p.id = package_id
+                    JOIN package_finding pf ON pf.package_id = p.id
+                    JOIN finding f ON f.id = pf.finding_id
+                    JOIN finding_data fd ON fd.finding_id = f.id
+                """)
+                instance_row = cur.fetchone()
+                cur.close()
+                conn.close()
+                
+                if instance_row:
+                    finding_instances = {
+                        'total': instance_row[0] or 0,
+                        'critical': instance_row[1] or 0,
+                        'high': instance_row[2] or 0,
+                        'medium': instance_row[3] or 0,
+                        'low': instance_row[4] or 0
+                    }
+                else:
+                    finding_instances = {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+            except Exception as e:
+                console.print(f"[red]Error fetching finding instances: {e}[/red]")
+                finding_instances = {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
         else:
             # Fallback if no dataset_metrics exist
             critical_finding_count = 0
@@ -414,6 +512,9 @@ def get_dataset_info():
             rps_score = None
             pes_score = None
             package_metrics = (0, 0, 0, 0, 0, 0)
+            finding_instances = {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+            finding_backlog = {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+            package_types = {}
 
         return {
             'id': dataset_id,
@@ -436,6 +537,9 @@ def get_dataset_info():
                 'medium': medium_finding_count,
                 'low': low_finding_count
             },
+            'finding_instances': finding_instances,
+            'finding_backlog': finding_backlog,
+            'package_types': package_types,
             'package_metrics': package_metrics,
             'rps_score': rps_score,
             'pes_score': pes_score
@@ -737,31 +841,54 @@ def create_package_health_panel(dataset_info):
     total_packages, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates = metrics
 
     findings = dataset_info['findings']
+    finding_instances = dataset_info.get('finding_instances', {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0})
+    finding_backlog = dataset_info.get('finding_backlog', {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0})
+    package_types = dataset_info.get('package_types', {})
 
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan", width=25)
-    table.add_column(justify="right")
+    table.add_column(justify="right", width=12)
+    table.add_column(justify="right", width=12)
+    table.add_column(justify="right", width=12)
 
-    # Vulnerability findings first
-    table.add_row("[bold]! Vulnerability Findings[/]", "")
-    table.add_row("🔴 Critical:", f"[bold red]{findings['critical']:,}[/]")
-    table.add_row("🟠 High:", f"[red]{findings['high']:,}[/]")
-    table.add_row("🟡 Medium:", f"[yellow]{findings['medium']:,}[/]")
-    table.add_row("🟢 Low:", f"[green]{findings['low']:,}[/]")
-    table.add_row("[ Total Findings:", f"[bold cyan]{findings['total']:,}[/]")
-    table.add_row("", "")
-    table.add_row("", "")
+    # FINDINGS SECTION
+    table.add_row("[bold yellow]═══ FINDINGS ═══[/]", "", "", "")
+    table.add_row("", "", "", "")
+    
+    # Column headers
+    table.add_row("", "[bold cyan]By Type[/]", "[bold cyan]By Instance[/]", "[bold cyan]Backlog[/]")
+    table.add_row("🔴 Critical:", f"[bold red]{findings['critical']:,}[/]", f"[bold red]{finding_instances['critical']:,}[/]", f"[bold red]{int(finding_backlog['critical']):,}[/]")
+    table.add_row("🟠 High:", f"[red]{findings['high']:,}[/]", f"[red]{finding_instances['high']:,}[/]", f"[red]{int(finding_backlog['high']):,}[/]")
+    table.add_row("🟡 Medium:", f"[yellow]{findings['medium']:,}[/]", f"[yellow]{finding_instances['medium']:,}[/]", f"[yellow]{int(finding_backlog['medium']):,}[/]")
+    table.add_row("🟢 Low:", f"[green]{findings['low']:,}[/]", f"[green]{finding_instances['low']:,}[/]", f"[green]{int(finding_backlog['low']):,}[/]")
+    table.add_row("[ Total:", f"[bold cyan]{findings['total']:,}[/]", f"[bold cyan]{finding_instances['total']:,}[/]", f"[bold cyan]{int(finding_backlog['total']):,}[/]")
+    table.add_row("", "", "", "")
+    table.add_row("", "", "", "")
 
-    # Package health metrics
-    table.add_row("[bold]* Package Health[/]", "")
-    table.add_row("* Total Packages:", f"[bold cyan]{total_packages:,}[/]")
-    table.add_row("", "")
-    table.add_row("🔴 Major Behind:", f"[red]{major_behind:,}[/]")
-    table.add_row("🟡 Minor Behind:", f"[yellow]{minor_behind:,}[/]")
-    table.add_row("🟢 Patch Behind:", f"[green]{patch_behind:,}[/]")
-    table.add_row("", "")
-    table.add_row("T Stale (>2yr):", f"[dim]{stale_packages:,}[/]")
-    table.add_row("✨ Has Updates:", f"[cyan]{packages_with_updates:,}[/]")
+    # PACKAGES SECTION
+    table.add_row("[bold yellow]═══ PACKAGES ═══[/]", "", "", "")
+    table.add_row("", "", "", "")
+    
+    # Total packages first
+    table.add_row("* Total Packages:", f"[bold cyan]{total_packages:,}[/]", "", "")
+    table.add_row("", "", "", "")
+    
+    # Get package types sorted by count
+    sorted_types = sorted(package_types.items(), key=lambda x: x[1], reverse=True)
+    
+    # Show package types in left column
+    for pkg_type, pkg_count in sorted_types:
+        table.add_row(f"  {pkg_type}:", f"[cyan]{pkg_count:,}[/]", "", "")
+    
+    table.add_row("", "", "", "")
+    
+    # Health metrics in left column
+    table.add_row("🔴 Major Behind:", f"[red]{major_behind:,}[/]", "", "")
+    table.add_row("🟡 Minor Behind:", f"[yellow]{minor_behind:,}[/]", "", "")
+    table.add_row("🟢 Patch Behind:", f"[green]{patch_behind:,}[/]", "", "")
+    table.add_row("", "", "", "")
+    table.add_row("T Stale (>2yr):", f"[dim]{stale_packages:,}[/]", "", "")
+    table.add_row("✨ Has Updates:", f"[cyan]{packages_with_updates:,}[/]", "", "")
 
     # Add RPS and PES scores
     table.add_row("", "")
