@@ -152,7 +152,7 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mrs_db
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
-      JAVA_TOOL_OPTIONS: "-XX:StartFlightRecording=duration=300s,filename=/tmp/profile.jfr -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.port=9010 -Dcom.sun.management.jmxremote.rmi.port=9010 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Djava.rmi.server.hostname=localhost"
+      JAVA_TOOL_OPTIONS: "-Xmx16g -XX:StartFlightRecording=duration=300s,filename=/tmp/profile.jfr -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.port=9010 -Dcom.sun.management.jmxremote.rmi.port=9010 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Djava.rmi.server.hostname=localhost"
     depends_on:
       postgres:
         condition: service_healthy
