@@ -395,14 +395,14 @@ def get_dataset_info():
             total_findings = metrics_row.get('totalFindings') or 0
             package_count = metrics_row.get('packages') or 0
             packages_with_findings = metrics_row.get('packagesWithFindings') or 0
+            downlevel_packages = metrics_row.get('downlevelPackages') or 0
             major_behind = metrics_row.get('downlevelPackagesMajor') or 0
             minor_behind = metrics_row.get('downlevelPackagesMinor') or 0
             patch_behind = metrics_row.get('downlevelPackagesPatch') or 0
             stale_packages = metrics_row.get('stalePackagesTwoYears') or 0
-            packages_with_updates = package_count - major_behind - minor_behind - patch_behind
             rps_score = metrics_row.get('rpsScore')
             pes_score = metrics_row.get('patchEfficacyScore')
-            package_metrics = (package_count, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates)
+            package_metrics = (package_count, downlevel_packages, major_behind, minor_behind, patch_behind, stale_packages)
             
             # Extract backlog metrics
             backlog_30_60 = metrics_row.get('findingsInBacklogBetweenThirtyAndSixtyDays') or 0
@@ -841,7 +841,7 @@ def create_package_health_panel(dataset_info):
         return Panel("⚠️  Unable to fetch package metrics", title="Package Health", border_style="red")
 
     metrics = dataset_info['package_metrics']
-    total_packages, major_behind, minor_behind, patch_behind, stale_packages, packages_with_updates = metrics
+    total_packages, downlevel_packages, major_behind, minor_behind, patch_behind, stale_packages = metrics
 
     findings = dataset_info['findings']
     finding_instances = dataset_info.get('finding_instances', {'total': 0, 'critical': 0, 'high': 0, 'medium': 0, 'low': 0})
@@ -901,7 +901,6 @@ def create_package_health_panel(dataset_info):
     table.add_row("🟢 Patch Behind:", f"[green]{patch_behind:,}[/]", "", "")
     table.add_row("", "", "", "")
     table.add_row("T Stale (>2yr):", f"[dim]{stale_packages:,}[/]", "", "")
-    table.add_row("✨ Has Updates:", f"[cyan]{packages_with_updates:,}[/]", "", "")
 
     # Add RPS and PES scores
     table.add_row("", "")
@@ -920,9 +919,9 @@ def create_package_health_panel(dataset_info):
     else:
         table.add_row("📊 PES Score:", "[dim]N/A[/]")
 
-    # Calculate percentage downlevel
+    # Calculate percentage downlevel using total downlevel count
     if total_packages > 0:
-        downlevel_pct = ((major_behind + minor_behind + patch_behind) / total_packages) * 100
+        downlevel_pct = (downlevel_packages / total_packages) * 100
         table.add_row("", "")
         table.add_row("📉 Downlevel %:", f"[{'red' if downlevel_pct > 50 else 'yellow' if downlevel_pct > 25 else 'green'}]{downlevel_pct:.1f}%[/]")
 
